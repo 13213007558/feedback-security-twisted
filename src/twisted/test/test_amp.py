@@ -9,6 +9,7 @@ Tests for L{twisted.protocols.amp}.
 
 import datetime
 import decimal
+from struct import pack
 from typing import ClassVar, TypeVar
 from unittest import skipIf
 
@@ -878,6 +879,208 @@ class CommandLocatorTests(TestCase):
             self.assertEqual(values, amp.AmpBox(cookieplus=b"8"))
 
         return result.addCallback(done)
+
+
+class EnvelopeValidationTests(TestCase):
+    """
+    Tests for the envelope validation L{amp.BoxDispatcher} performs before
+    dispatching a received box, driven by feeding fragmented bytes to
+    L{amp.BinaryBoxProtocol}.
+    """
+
+    def setUp(self):
+        """
+        Connect a L{amp.BinaryBoxProtocol} to a L{amp.BoxDispatcher} backed
+        by a L{TestLocator}, so that responder invocation, argument
+        conversion, and outstanding L{Deferred}s can all be observed.
+        """
+        self.locator = TestLocator()
+        self.dispatcher = amp.BoxDispatcher(self.locator)
+        self.protocol = amp.BinaryBoxProtocol(self.dispatcher)
+        self.transport = StringTransport()
+        self.protocol.makeConnection(self.transport)
+
+    def feed(self, boxBytes, chunkSize=3):
+        """
+        Deliver C{boxBytes} to the protocol in chunks of C{chunkSize} bytes.
+        """
+        for offset in range(0, len(boxBytes), chunkSize):
+            self.protocol.dataReceived(boxBytes[offset : offset + chunkSize])
+
+    def callRemoteGreeting(self):
+        """
+        Send a L{SimpleGreeting} and return the L{Deferred} waiting for its
+        answer; the peer's correlation identifier for it is C{b"1"}.
+        """
+        return self.dispatcher.callRemote(SimpleGreeting, greeting="hello", cookie=1)
+
+    def loseConnection(self):
+        """
+        Simulate the transport going away after a protocol failure.
+        """
+        self.protocol.connectionLost(Failure(error.ConnectionLost("done")))
+
+    def test_validCommandWithAnswer(self):
+        """
+        A well-formed '_command' / '_ask' box is dispatched to the responder
+        with its arguments converted to their Python types, and an answer
+        box is emitted.
+        """
+        box = amp.AmpBox(
+            {
+                b"_command": b"simple",
+                b"_ask": b"1",
+                b"greeting": b"hello",
+                b"cookie": b"3",
+            }
+        )
+        self.feed(box.serialize())
+        self.assertEqual(self.locator.greetings, [("hello", 3)])
+        self.assertEqual(
+            amp.parseString(self.transport.value()),
+            [amp.AmpBox({b"_answer": b"1", b"cookieplus": b"6"})],
+        )
+
+    def test_validCommandWithoutAnswer(self):
+        """
+        A well-formed '_command' box without an '_ask' key is dispatched to
+        the responder and no response is emitted.
+        """
+        box = amp.AmpBox({b"_command": b"simple", b"greeting": b"hi", b"cookie": b"2"})
+        self.feed(box.serialize())
+        self.assertEqual(self.locator.greetings, [("hi", 2)])
+        self.assertEqual(self.transport.value(), b"")
+
+    def test_validErrorAnswer(self):
+        """
+        A well-formed '_error' box fails the L{Deferred} of the outstanding
+        request it refers to.
+        """
+        d = self.callRemoteGreeting()
+        errors = []
+        d.addErrback(errors.append)
+        box = amp.AmpBox(
+            {
+                b"_error": b"1",
+                b"_error_code": b"NOPE",
+                b"_error_description": b"it broke",
+            }
+        )
+        self.feed(box.serialize())
+        self.assertEqual(len(errors), 1)
+        errors[0].trap(amp.UnknownRemoteError)
+        self.assertFalse(self.transport.disconnecting)
+
+    def test_unknownAnswerIdentifier(self):
+        """
+        An '_answer' box naming a request which is not outstanding is
+        rejected with L{amp.InvalidEnvelope} and fails the protocol; the
+        L{Deferred} of the request which I{is} outstanding is left alone
+        until the connection is lost.
+        """
+        d = self.callRemoteGreeting()
+        box = amp.AmpBox({b"_answer": b"2", b"cookieplus": b"4"})
+        self.feed(box.serialize())
+        self.assertTrue(self.transport.disconnecting)
+        self.assertNoResult(d)
+        self.assertEqual(self.locator.greetings, [])
+        self.loseConnection()
+        self.failureResultOf(d, amp.InvalidEnvelope)
+
+    def test_mixedAnswerAndCommand(self):
+        """
+        A box carrying both '_answer' and '_command' is rejected before the
+        outstanding request is popped or the command is dispatched.
+        """
+        d = self.callRemoteGreeting()
+        box = amp.AmpBox(
+            {
+                b"_answer": b"1",
+                b"_command": b"simple",
+                b"greeting": b"hello",
+                b"cookie": b"3",
+                b"cookieplus": b"9",
+            }
+        )
+        self.feed(box.serialize())
+        self.assertTrue(self.transport.disconnecting)
+        self.assertNoResult(d)
+        self.assertEqual(self.locator.greetings, [])
+        self.loseConnection()
+        self.failureResultOf(d, amp.InvalidEnvelope)
+
+    def test_duplicateReservedKey(self):
+        """
+        A box repeating a reserved key is rejected while it is being parsed;
+        neither the rest of that box nor any trailing, well-formed box in
+        the same chunk is dispatched.
+        """
+
+        def pair(key, value):
+            return pack("!H", len(key)) + key + pack("!H", len(value)) + value
+
+        d = self.callRemoteGreeting()
+        duplicate = pair(b"_answer", b"1") + pair(b"_answer", b"1") + b"\x00\x00"
+        validAnswer = amp.AmpBox({b"_answer": b"1", b"cookieplus": b"4"}).serialize()
+        self.feed(duplicate + validAnswer)
+        self.assertTrue(self.transport.disconnecting)
+        self.assertNoResult(d)
+        # Data arriving after the protocol failed is ignored as well.
+        self.feed(validAnswer)
+        self.assertNoResult(d)
+        self.loseConnection()
+        self.failureResultOf(d, amp.InvalidEnvelope)
+
+    def test_emptyAskIdentifier(self):
+        """
+        A '_command' box with an empty '_ask' correlation identifier is
+        rejected and never reaches the responder.
+        """
+        box = amp.AmpBox(
+            {
+                b"_command": b"simple",
+                b"_ask": b"",
+                b"greeting": b"hi",
+                b"cookie": b"2",
+            }
+        )
+        self.feed(box.serialize())
+        self.assertTrue(self.transport.disconnecting)
+        self.assertEqual(self.locator.greetings, [])
+
+    def test_emptyAnswerIdentifier(self):
+        """
+        An '_answer' box with an empty correlation identifier is rejected
+        without disturbing the outstanding request.
+        """
+        d = self.callRemoteGreeting()
+        box = amp.AmpBox({b"_answer": b"", b"cookieplus": b"4"})
+        self.feed(box.serialize())
+        self.assertTrue(self.transport.disconnecting)
+        self.assertNoResult(d)
+        self.loseConnection()
+        self.failureResultOf(d, amp.InvalidEnvelope)
+
+    def test_errorBoxMissingRequiredFields(self):
+        """
+        An '_error' box without '_error_code' and '_error_description' is
+        rejected without failing the outstanding request it names.
+        """
+        d = self.callRemoteGreeting()
+        box = amp.AmpBox({b"_error": b"1"})
+        self.feed(box.serialize())
+        self.assertTrue(self.transport.disconnecting)
+        self.assertNoResult(d)
+        self.loseConnection()
+        self.failureResultOf(d, amp.InvalidEnvelope)
+
+    def test_emptyBox(self):
+        """
+        A box with no keys at all fails the protocol rather than propagating
+        out of L{amp.BinaryBoxProtocol.dataReceived}.
+        """
+        self.feed(b"\x00\x00")
+        self.assertTrue(self.transport.disconnecting)
 
 
 SWITCH_CLIENT_DATA = b"Success!"

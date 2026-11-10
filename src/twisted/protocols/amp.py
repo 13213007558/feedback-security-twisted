@@ -258,6 +258,7 @@ __all__ = [
     "IResponderLocator",
     "IncompatibleVersions",
     "Integer",
+    "InvalidEnvelope",
     "InvalidSignature",
     "ListOf",
     "MAX_KEY_LENGTH",
@@ -298,6 +299,10 @@ ERROR_CODE = b"_error_code"
 ERROR_DESCRIPTION = b"_error_description"
 UNKNOWN_ERROR_CODE = b"UNKNOWN"
 UNHANDLED_ERROR_CODE = b"UNHANDLED"
+
+# Keys reserved for the AMP envelope itself.  Application arguments may not
+# reuse them, and each of them may appear at most once in any given box.
+_RESERVED_KEYS = frozenset([ASK, ANSWER, COMMAND, ERROR, ERROR_CODE, ERROR_DESCRIPTION])
 
 MAX_KEY_LENGTH = 0xFF
 MAX_VALUE_LENGTH = 0xFFFF
@@ -464,6 +469,16 @@ class NoEmptyBoxes(AmpError):
     """
     You can't have empty boxes on the connection.  This is raised when you
     receive or attempt to send one.
+    """
+
+
+class InvalidEnvelope(AmpError):
+    """
+    A box received from the network did not satisfy the structural
+    requirements of the AMP envelope: it combined several of the mutually
+    exclusive command, answer, and error roles, omitted a field required by
+    its role, carried an empty or unknown correlation identifier, or repeated
+    a reserved key.
     """
 
 
@@ -947,8 +962,16 @@ class BoxDispatcher:
         L{callRemote}.
 
         @param box: an AmpBox with a value for its L{ANSWER} key.
+
+        @raise InvalidEnvelope: if the L{ANSWER} key does not identify an
+            outstanding request.
         """
-        question = self._outstandingRequests.pop(box[ANSWER])
+        try:
+            question = self._outstandingRequests.pop(box[ANSWER])
+        except KeyError:
+            raise InvalidEnvelope(
+                f"answer received for unknown request: {box[ANSWER]!r}"
+            )
         question.addErrback(self.unhandledError)
         question.callback(box)
 
@@ -959,8 +982,14 @@ class BoxDispatcher:
 
         @param box: an L{AmpBox} with a value for its L{ERROR}, L{ERROR_CODE},
         and L{ERROR_DESCRIPTION} keys.
+
+        @raise InvalidEnvelope: if the L{ERROR} key does not identify an
+            outstanding request.
         """
-        question = self._outstandingRequests.pop(box[ERROR])
+        try:
+            question = self._outstandingRequests.pop(box[ERROR])
+        except KeyError:
+            raise InvalidEnvelope(f"error received for unknown request: {box[ERROR]!r}")
         question.addErrback(self.unhandledError)
         errorCode = box[ERROR_CODE]
         description = box[ERROR_DESCRIPTION]
@@ -1013,23 +1042,82 @@ class BoxDispatcher:
     def ampBoxReceived(self, box):
         """
         An AmpBox was received, representing a command, or an answer to a
-        previously issued command (either successful or erroneous).  Respond to
-        it according to its contents.
+        previously issued command (either successful or erroneous).  Respond
+        to it according to its contents.
+
+        The envelope is validated before anything is dispatched: a box must
+        play exactly one role (command, answer, or error), carry the fields
+        its role requires, and use a non-empty correlation identifier.
 
         @param box: an AmpBox
 
         @raise NoEmptyBoxes: when a box is received that does not contain an
         '_answer', '_command' / '_ask', or '_error' key; i.e. one which does not
         fit into the command / response protocol defined by AMP.
+
+        @raise InvalidEnvelope: when a box mixes several roles, omits a field
+        required by its role, carries an empty correlation identifier, or
+        refers to a request which is not outstanding.
         """
+        self._validateEnvelope(box)
         if ANSWER in box:
             self._answerReceived(box)
         elif ERROR in box:
             self._errorReceived(box)
-        elif COMMAND in box:
-            self._commandReceived(box)
         else:
+            self._commandReceived(box)
+
+    def _validateEnvelope(self, box):
+        """
+        Verify that C{box} plays exactly one role in the AMP protocol and
+        carries all of the fields that role requires, before any dispatching
+        (such as popping an outstanding request) takes place.
+
+        @param box: an L{AmpBox} to validate.
+
+        @raise NoEmptyBoxes: if C{box} plays no role at all.
+
+        @raise InvalidEnvelope: if C{box} mixes roles, lacks a required
+        field, or carries an empty correlation identifier.
+        """
+        isCommand = COMMAND in box
+        isAnswer = ANSWER in box
+        isError = ERROR in box
+        if not (isCommand or isAnswer or isError):
             raise NoEmptyBoxes(box)
+        if isCommand + isAnswer + isError != 1:
+            raise InvalidEnvelope(
+                "AMP box must be exactly one of a command, an answer, or an "
+                "error; got reserved keys: {!r}".format(
+                    sorted(key for key in box if key in _RESERVED_KEYS)
+                )
+            )
+        if isCommand:
+            allowed = {COMMAND, ASK}
+            required = set()
+        elif isAnswer:
+            allowed = {ANSWER}
+            required = set()
+        else:
+            allowed = {ERROR, ERROR_CODE, ERROR_DESCRIPTION}
+            required = {ERROR_CODE, ERROR_DESCRIPTION}
+        unexpected = {key for key in box if key in _RESERVED_KEYS} - allowed
+        if unexpected:
+            raise InvalidEnvelope(
+                f"reserved keys not allowed in this role: {sorted(unexpected)!r}"
+            )
+        missing = required - box.keys()
+        if missing:
+            raise InvalidEnvelope(
+                f"required keys missing from this role: {sorted(missing)!r}"
+            )
+        if isCommand and not box[COMMAND]:
+            raise InvalidEnvelope("command name must not be empty")
+        for correlationKey in (ASK, ANSWER, ERROR):
+            if correlationKey in box and not box[correlationKey]:
+                raise InvalidEnvelope(
+                    f"correlation identifier must not be empty: {correlationKey!r}"
+                )
 
     def _safeEmit(self, aBox):
         """
@@ -2277,6 +2365,11 @@ class BinaryBoxProtocol(
         connection is being closed because a key length prefix which was longer
         than allowed by the protocol was received.
 
+    @ivar _envelopeViolation: A L{Failure} describing the envelope violation
+        which caused the connection to be closed, or L{None} if the peer has
+        not sent a structurally invalid box.  Once set, no further data is
+        parsed as L{AmpBox}es.
+
     @ivar boxReceiver: an L{IBoxReceiver} provider, whose
         L{IBoxReceiver.ampBoxReceived} method will be invoked for each
         L{AmpBox} that is received.
@@ -2289,6 +2382,7 @@ class BinaryBoxProtocol(
     _currentBox = None
 
     _keyLengthLimitExceeded = False
+    _envelopeViolation = None
 
     hostCertificate = None
     noPeerCertificate = False  # for tests
@@ -2372,6 +2466,10 @@ class BinaryBoxProtocol(
         if self.innerProtocol is not None:
             self.innerProtocol.dataReceived(data)
             return
+        if self._envelopeViolation is not None:
+            # The connection is being dropped because the peer sent an invalid
+            # box; nothing it sends now may be parsed as another box.
+            return
         return Int16StringReceiver.dataReceived(self, data)
 
     def connectionLost(self, reason):
@@ -2384,6 +2482,8 @@ class BinaryBoxProtocol(
                 self.innerProtocolClientFactory.clientConnectionLost(None, reason)
         if self._keyLengthLimitExceeded:
             failReason = Failure(TooLong(True, False, None, None))
+        elif self._envelopeViolation is not None:
+            failReason = self._envelopeViolation
         elif reason.check(ConnectionClosed) and self._justStartedTLS:
             # We just started TLS and haven't received any data.  This means
             # the other connection didn't like our cert (although they may not
@@ -2413,6 +2513,18 @@ class BinaryBoxProtocol(
         self._currentBox = AmpBox()
         return self.proto_key(string)
 
+    def _failEnvelope(self, reason):
+        """
+        The peer sent a box which violates the structure of the AMP envelope.
+        Drop the connection and refuse to parse anything further, so that no
+        trailing bytes can be mistaken for another, valid box.
+
+        @param reason: an exception instance describing the violation.
+        """
+        if self._envelopeViolation is None:
+            self._envelopeViolation = Failure(reason)
+        self.transport.loseConnection()
+
     def proto_key(self, string):
         """
         String received in the 'key' state.  If the key is empty, a complete
@@ -2423,14 +2535,26 @@ class BinaryBoxProtocol(
             self.MAX_LENGTH = self._MAX_VALUE_LENGTH
             return "value"
         else:
-            self.boxReceiver.ampBoxReceived(self._currentBox)
+            box = self._currentBox
             self._currentBox = None
+            try:
+                self.boxReceiver.ampBoxReceived(box)
+            except (InvalidEnvelope, NoEmptyBoxes) as e:
+                self._failEnvelope(e)
             return "init"
 
     def proto_value(self, string):
         """
         String received in the 'value' state.
         """
+        if self._currentKey in _RESERVED_KEYS and self._currentKey in self._currentBox:
+            duplicateKey = self._currentKey
+            self._currentKey = None
+            self.MAX_LENGTH = self._MAX_KEY_LENGTH
+            self._failEnvelope(
+                InvalidEnvelope(f"duplicate reserved key: {duplicateKey!r}")
+            )
+            return "key"
         self._currentBox[self._currentKey] = string
         self._currentKey = None
         self.MAX_LENGTH = self._MAX_KEY_LENGTH
