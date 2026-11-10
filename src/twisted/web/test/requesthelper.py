@@ -17,9 +17,11 @@ from incremental import Version
 
 from twisted.internet.address import IPv4Address, IPv6Address
 from twisted.internet.defer import Deferred
+from twisted.internet.error import ConnectionDone
 from twisted.internet.interfaces import IAddress, ISSLTransport
 from twisted.internet.task import Clock
 from twisted.python.deprecate import deprecated
+from twisted.python.failure import Failure
 from twisted.trial import unittest
 from twisted.web._responses import FOUND
 from twisted.web.http_headers import Headers
@@ -215,6 +217,7 @@ class DummyRequest:
     prepath: list[bytes]
     args: dict[bytes, list[bytes]]
     _finishedDeferreds: list[Deferred[None]]
+    _disconnected: bool
 
     def registerProducer(self, prod, s):
         """
@@ -252,6 +255,7 @@ class DummyRequest:
         self.responseHeaders = Headers()
         self.responseCode = None
         self._finishedDeferreds = []
+        self._disconnected = False
         self._serverName = b"dummy"
         self.clientproto = b"HTTP/1.0"
 
@@ -347,6 +351,22 @@ class DummyRequest:
         """
         Errback and L{Deferreds} waiting for finish notification.
         """
+        if self._finishedDeferreds is not None:
+            observers = self._finishedDeferreds
+            self._finishedDeferreds = None
+            for obs in observers:
+                obs.errback(reason)
+
+    def connectionLost(self, reason=None):
+        """
+        Simulate the underlying connection going away, mirroring
+        L{twisted.web.http.Request.connectionLost}: mark the request as
+        disconnected and errback every L{Deferred} returned by
+        C{notifyFinish}.
+        """
+        if reason is None:
+            reason = Failure(ConnectionDone())
+        self._disconnected = True
         if self._finishedDeferreds is not None:
             observers = self._finishedDeferreds
             self._finishedDeferreds = None
@@ -513,3 +533,21 @@ class DummyRequestTests(unittest.SynchronousTestCase):
         request.client = client
         address = request.getClientAddress()
         self.assertIs(address, client)
+
+    def test_connectionLost(self):
+        """
+        L{DummyRequest.connectionLost} marks the request as disconnected and
+        errbacks every L{Deferred} returned by C{notifyFinish}, mirroring
+        L{twisted.web.http.Request.connectionLost}.
+        """
+        request = DummyRequest([])
+        finished = request.notifyFinish()
+        reason = Failure(ConnectionDone())
+
+        request.connectionLost(reason)
+
+        self.assertTrue(request._disconnected)
+        self.assertIs(self.failureResultOf(finished).value, reason.value)
+        # Observers are cleared, so a second connectionLost is a no-op rather
+        # than firing them again.
+        self.assertIsNone(request._finishedDeferreds)

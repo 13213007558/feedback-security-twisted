@@ -431,3 +431,36 @@ class DeferredResourceTests(SynchronousTestCase):
         gc.collect()
         errors = self.flushLoggedErrors(RuntimeError)
         self.assertEqual(errors, [])
+
+    def test_renderIgnoredAfterDisconnect(self):
+        """
+        If the request is disconnected before the L{Deferred} fires with a
+        resource, L{DeferredResource} does not try to render onto the dead
+        request.
+        """
+        request = DummyRequest([])
+        pending = defer.Deferred()
+        deferredResource = DeferredResource(pending)
+        deferredResource.render(request)
+
+        request.connectionLost(Failure(RuntimeError("disconnected")))
+        pending.callback(resource.Resource())
+
+        self.assertEqual(request.written, [])
+
+    def test_renderFailureIgnoredAfterDisconnect(self):
+        """
+        If the request is disconnected before the L{Deferred} fails,
+        L{DeferredResource} does not call C{processingFailed} on the dead
+        request and does not leave an unhandled error behind.
+        """
+        request = DummyRequest([])
+        pending = defer.Deferred()
+        deferredResource = DeferredResource(pending)
+        deferredResource.render(request)
+
+        request.connectionLost(Failure(RuntimeError("disconnected")))
+        pending.errback(Failure(RuntimeError("late failure")))
+
+        self.assertEqual(request.written, [])
+        self.assertEqual(self.flushLoggedErrors(RuntimeError), [])

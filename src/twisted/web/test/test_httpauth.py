@@ -19,6 +19,7 @@ from twisted.cred.checkers import (
 )
 from twisted.cred.credentials import IUsernamePassword
 from twisted.internet.address import IPv4Address
+from twisted.internet.defer import CancelledError, Deferred, fail, succeed
 from twisted.internet.error import ConnectionDone
 from twisted.internet.testing import EventLoggingObserver
 from twisted.logger import globalLogPublisher
@@ -32,6 +33,7 @@ from twisted.web.resource import IResource, Resource, getChildForRequest
 from twisted.web.server import NOT_DONE_YET
 from twisted.web.static import Data
 from twisted.web.test.test_web import DummyRequest
+from twisted.web.util import DeferredResource
 
 
 def b64encode(s):
@@ -642,3 +644,297 @@ class HTTPAuthHeaderTests(unittest.TestCase):
         d.addCallback(cbFinished)
         request.render(child)
         return d
+
+
+class UncancellableDeferred(Deferred):
+    """
+    A L{Deferred} on which C{cancel} only records the request to cancel.
+
+    This models an underlying authentication operation which cannot actually
+    be aborted: the wrapper still asks for cancellation when the request goes
+    away, but the Deferred stays pending until the slow authentication
+    completes and delivers its (late) result.
+    """
+
+    def __init__(self):
+        Deferred.__init__(self)
+        self.cancelRequested = 0
+
+    def cancel(self):
+        self.cancelRequested += 1
+
+
+@implementer(portal.IRealm)
+class AvatarLifecycleRealm:
+    """
+    An L{IRealm} which records how many avatars it created and how many of
+    their logout callbacks ran, and lets tests drive when those callbacks
+    fail.
+    """
+
+    def __init__(self, avatar, logoutError=None):
+        self.loggedIn = 0
+        self.loggedOut = 0
+        self._avatar = avatar
+        self._logoutError = logoutError
+
+    def requestAvatar(self, avatarId, mind, *interfaces):
+        if IResource in interfaces:
+            self.loggedIn += 1
+            return IResource, self._avatar, self.logout
+        raise NotImplementedError()
+
+    def logout(self):
+        self.loggedOut += 1
+        if self._logoutError is not None:
+            raise self._logoutError
+
+
+class ControlledPortal:
+    """
+    A portal stand-in whose C{login} returns a L{Deferred} the test controls
+    directly, so the timing of authentication results relative to the request
+    lifecycle can be exercised precisely.
+
+    For a pending (slow) login, C{fireSuccess} asks the supplied realm to
+    create the avatar and delivers it, while C{fireFailure} delivers an error.
+    For synchronous results, pass an already-fired L{Deferred}.
+    """
+
+    def __init__(self, realm=None, loginResult=None):
+        self._realm = realm
+        self._loginResult = loginResult
+        self.loginCalls = 0
+        self.pending = None
+
+    def login(self, credentials, mind, *interfaces):
+        self.loginCalls += 1
+        self._credentials = credentials
+        self._mind = mind
+        self._interfaces = interfaces
+        if self._loginResult is not None:
+            return self._loginResult
+        self.pending = UncancellableDeferred()
+        return self.pending
+
+    def fireSuccess(self):
+        result = self._realm.requestAvatar(
+            ANONYMOUS, self._mind, *self._interfaces
+        )
+        self.pending.callback(result)
+
+    def fireFailure(self, failure):
+        self.pending.errback(failure)
+
+
+class HTTPAuthLogoutLifecycleTests(unittest.SynchronousTestCase):
+    """
+    Tests binding the cred logout hook to the full request lifecycle of
+    L{HTTPAuthSessionWrapper}, including requests which are disconnected
+    while authentication is still in progress.
+    """
+
+    def _slowWrapper(self, realm, factories=()):
+        """
+        Build a wrapper whose portal keeps the login L{Deferred} pending until
+        the test fires it.
+        """
+        portal = ControlledPortal(realm=realm)
+        return portal, HTTPAuthSessionWrapper(portal, list(factories))
+
+    def _syncWrapper(self, realm, loginResult, factories=()):
+        """
+        Build a wrapper whose portal returns an already-fired login L{Deferred}.
+        """
+        portal = ControlledPortal(realm=realm, loginResult=loginResult)
+        return portal, HTTPAuthSessionWrapper(portal, list(factories))
+
+    def _startRender(self, wrapper, request):
+        """
+        Drive a request through the real L{DeferredResource} render path and
+        return the L{DeferredResource} which is waiting on authentication.
+        """
+        resource = wrapper._authorizedResource(request)
+        resource.render(request)
+        return resource
+
+    def test_logoutAfterNormalRender(self):
+        """
+        Once an avatar finishes rendering and the request completes normally,
+        the logout callback runs exactly once.  While the resource is still
+        rendering it must not have run yet.
+        """
+
+        class SlowResource(Resource):
+            def render(self, request):
+                return NOT_DONE_YET
+
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(SlowResource())
+        portal, wrapper = self._slowWrapper(realm)
+
+        self._startRender(wrapper, request)
+        portal.fireSuccess()
+        self.assertEqual(realm.loggedIn, 1)
+        # Still rendering: logout must wait for the request to finish.
+        self.assertEqual(realm.loggedOut, 0)
+        request.finish()
+        self.assertEqual(realm.loggedOut, 1)
+
+    def test_logoutAfterRenderError(self):
+        """
+        If the request fails while the avatar is being rendered, the logout
+        callback still runs exactly once.
+        """
+
+        class SlowResource(Resource):
+            def render(self, request):
+                return NOT_DONE_YET
+
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(SlowResource())
+        portal, wrapper = self._slowWrapper(realm)
+
+        self._startRender(wrapper, request)
+        portal.fireSuccess()
+        request.processingFailed(Failure(ConnectionDone("disconnect")))
+        self.assertEqual(realm.loggedOut, 1)
+
+    def test_noLogoutBeforeAvatarAcquired(self):
+        """
+        Disconnecting while authentication is still pending never invokes a
+        logout callback, because no avatar has been acquired yet.
+        """
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(Data(b"hello", "text/plain"))
+        portal, wrapper = self._slowWrapper(realm)
+
+        self._startRender(wrapper, request)
+        request.connectionLost(Failure(ConnectionDone("disconnect")))
+        self.assertEqual(realm.loggedIn, 0)
+        self.assertEqual(realm.loggedOut, 0)
+
+    def test_disconnectCancelsPendingLogin(self):
+        """
+        When the request disconnects before authentication completes, the
+        pending login L{Deferred} is cancelled so the underlying
+        authentication is abandoned.
+        """
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(Data(b"hello", "text/plain"))
+
+        def canceller(deferred):
+            deferred.errback(Failure(CancelledError()))
+
+        login = Deferred(canceller)
+        portal, wrapper = self._syncWrapper(realm, login)
+
+        self._startRender(wrapper, request)
+        request.connectionLost(Failure(ConnectionDone("disconnect")))
+        # The CancelledError was handled, not left as an unhandled error.
+        self.assertEqual(self.flushLoggedErrors(CancelledError), [])
+        self.assertEqual(realm.loggedIn, 0)
+        self.assertEqual(realm.loggedOut, 0)
+
+    def test_lateLoginSuccessAfterDisconnectLogsOut(self):
+        """
+        If the request disconnects during authentication but the (uncancellable)
+        authentication nevertheless succeeds afterwards, the avatar which is
+        then created still gets logged out exactly once even though it is never
+        rendered.
+        """
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(Data(b"hello", "text/plain"))
+        portal, wrapper = self._slowWrapper(realm)
+
+        self._startRender(wrapper, request)
+        request.connectionLost(Failure(ConnectionDone("disconnect")))
+        # Cancellation was requested, but the slow auth still completes and
+        # the realm really creates an avatar.
+        self.assertEqual(portal.pending.cancelRequested, 1)
+        portal.fireSuccess()
+
+        self.assertEqual(realm.loggedIn, 1)
+        self.assertEqual(realm.loggedOut, 1)
+        # Rendering onto the dead request must not have been attempted.
+        self.assertEqual(request.written, [])
+
+    def test_lateLoginFailureAfterDisconnect(self):
+        """
+        If authentication fails only after the request was disconnected, no
+        avatar exists and therefore no logout callback runs, and the failure is
+        not delivered to the dead request as a response.
+        """
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(Data(b"hello", "text/plain"))
+        portal, wrapper = self._slowWrapper(realm)
+
+        self._startRender(wrapper, request)
+        request.connectionLost(Failure(ConnectionDone("disconnect")))
+        portal.fireFailure(Failure(error.Unauthorized()))
+
+        self.assertEqual(realm.loggedIn, 0)
+        self.assertEqual(realm.loggedOut, 0)
+        self.assertEqual(self.flushLoggedErrors(error.Unauthorized), [])
+
+    def test_failingLogoutDoesNotRepeatOrPropagate(self):
+        """
+        If the logout callback itself raises, the error is logged but logout is
+        not attempted a second time and the late result still settles without
+        propagating the error.
+        """
+
+        class LogoutFailure(Exception):
+            pass
+
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(
+            Data(b"hello", "text/plain"), logoutError=LogoutFailure("boom")
+        )
+        portal, wrapper = self._slowWrapper(realm)
+
+        self._startRender(wrapper, request)
+        request.connectionLost(Failure(ConnectionDone("disconnect")))
+        portal.fireSuccess()
+
+        self.assertEqual(realm.loggedIn, 1)
+        self.assertEqual(realm.loggedOut, 1)
+        errors = self.flushLoggedErrors(LogoutFailure)
+        self.assertEqual(len(errors), 1)
+
+    def test_childTraversalStillWrapsLogout(self):
+        """
+        Normal child resource traversal keeps working: the avatar's child is
+        rendered and its logout runs when the request finishes.
+        """
+        childContent = b"child body"
+        request = DummyRequest([b"child"])
+        avatar = Resource()
+        avatar.putChild(b"child", Data(childContent, "text/plain"))
+        realm = AvatarLifecycleRealm(avatar)
+        login = succeed((IResource, avatar, realm.logout))
+        _portal, wrapper = self._syncWrapper(realm, login)
+
+        child = getChildForRequest(wrapper, request)
+        request.render(child)
+        self.assertEqual(request.written, [childContent])
+        request.finish()
+        self.assertEqual(realm.loggedOut, 1)
+
+    def test_loginFailureStillProducesUnauthorized(self):
+        """
+        A normal authentication failure (request still connected) produces the
+        challenge resource and never calls logout, since no avatar was made.
+        """
+        request = DummyRequest([])
+        realm = AvatarLifecycleRealm(Data(b"hello", "text/plain"))
+        login = fail(error.Unauthorized())
+        _portal, wrapper = self._syncWrapper(
+            realm, login, factories=[BasicCredentialFactory("example.com")]
+        )
+
+        resource = wrapper._authorizedResource(request)
+        self.assertIsInstance(resource, DeferredResource)
+        resource.render(request)
+        self.assertEqual(realm.loggedIn, 0)
+        self.assertEqual(realm.loggedOut, 0)

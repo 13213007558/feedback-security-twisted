@@ -160,9 +160,21 @@ class DeferredResource(resource.Resource):
         return NOT_DONE_YET
 
     def _cbChild(self, child, request):
+        if getattr(request, "_disconnected", False):
+            # The client went away while the Deferred was pending.  Any
+            # resource (and its logout hook) is now cleaned up by its owner, so
+            # rendering onto a request that can no longer deliver a response
+            # would only raise.
+            return
         request.render(resource.getChildForRequest(child, request))
 
     def _ebChild(self, reason, request):
+        if getattr(request, "_disconnected", False):
+            # The request is already gone (for example because it was
+            # disconnected while authentication was in progress); calling
+            # processingFailed would try to finish a response that can never
+            # be sent and raise instead.
+            return
         request.processingFailed(reason)
 
 

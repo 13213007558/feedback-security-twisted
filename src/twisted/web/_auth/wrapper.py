@@ -18,6 +18,7 @@ from zope.interface import implementer
 
 from twisted.cred import error
 from twisted.cred.credentials import Anonymous
+from twisted.internet.defer import CancelledError
 from twisted.logger import Logger
 from twisted.python.components import proxyForInterface
 from twisted.web import util
@@ -114,7 +115,7 @@ class HTTPAuthSessionWrapper:
         """
         authheader = request.getHeader(b"authorization")
         if not authheader:
-            return util.DeferredResource(self._login(Anonymous()))
+            return util.DeferredResource(self._login(Anonymous(), request))
 
         factory, respString = self._selectParseHeader(authheader)
         if factory is None:
@@ -127,7 +128,7 @@ class HTTPAuthSessionWrapper:
             self._log.failure("Unexpected failure from credentials factory")
             return _UnsafeErrorPage(500, "Internal Error", "")
         else:
-            return util.DeferredResource(self._login(credentials))
+            return util.DeferredResource(self._login(credentials, request))
 
     def render(self, request):
         """
@@ -150,24 +151,62 @@ class HTTPAuthSessionWrapper:
         request.postpath.insert(0, request.prepath.pop())
         return self._authorizedResource(request)
 
-    def _login(self, credentials):
+    def _login(self, credentials, request):
         """
         Get the L{IResource} avatar for the given credentials.
+
+        If the request is disconnected before authentication completes, the
+        login L{Deferred} is cancelled so the underlying authentication work
+        is abandoned instead of being left running for a client that is gone.
 
         @return: A L{Deferred} which will be called back with an L{IResource}
             avatar or which will errback if authentication fails.
         """
         d = self._portal.login(credentials, None, IResource)
-        d.addCallbacks(self._loginSucceeded, self._loginFailed)
+        d.addCallbacks(
+            self._loginSucceeded,
+            self._loginFailed,
+            callbackArgs=(request,),
+        )
+
+        def _cancelLogin(ignored):
+            d.cancel()
+
+        request.notifyFinish().addErrback(_cancelLogin)
         return d
 
-    def _loginSucceeded(self, args):
+    def _loginSucceeded(self, args, request):
         """
         Handle login success by wrapping the resulting L{IResource} avatar
-        so that the C{logout} callback will be invoked when rendering is
-        complete.
+        so that the C{logout} callback will be invoked exactly once when the
+        request has reached the end of its life.
+
+        The logout hook is bound to the request lifecycle rather than to the
+        point at which the avatar is rendered.  This matters when the request
+        is disconnected while authentication is still in progress: the avatar
+        may only be created after the connection is gone, in which case it is
+        never rendered and would otherwise have no way to be released.
         """
         interface, avatar, logout = args
+
+        # Shared state for the render hook and the disconnected-request hook
+        # so that logout runs exactly once however the request ends.
+        state = {"loggedOut": False}
+
+        def doLogout():
+            if state["loggedOut"]:
+                return
+            state["loggedOut"] = True
+            try:
+                logout()
+            except BaseException:
+                self._log.failure("Avatar logout callback failed")
+
+        # If the request was already disconnected before this (late) login
+        # result arrived, the avatar will never be rendered, so release it now.
+        # For a live request the render hook below owns the logout.
+        if getattr(request, "_disconnected", False):
+            doLogout()
 
         class ResourceWrapper(proxyForInterface(IResource, "resource")):
             """
@@ -194,7 +233,7 @@ class HTTPAuthSessionWrapper:
                 finished completely (with or without error), C{logout} is
                 called.
                 """
-                request.notifyFinish().addBoth(lambda ign: logout())
+                request.notifyFinish().addBoth(lambda ignored: doLogout())
                 return super().render(request)
 
         return ResourceWrapper(avatar)
@@ -207,13 +246,17 @@ class HTTPAuthSessionWrapper:
         """
         if result.check(error.Unauthorized, error.LoginFailed):
             return UnauthorizedResource(self._credentialFactories)
-        else:
-            self._log.failure(
-                "HTTPAuthSessionWrapper.getChildWithDefault encountered "
-                "unexpected error",
-                failure=result,
-            )
-            return _UnsafeErrorPage(500, "Internal Error", "")
+        if result.check(CancelledError):
+            # The request was disconnected while login was in progress, so
+            # there is no client left to send an error page to and no avatar
+            # has been acquired that needs to be released.
+            return _UnsafeErrorPage(503, "Service Unavailable", "")
+        self._log.failure(
+            "HTTPAuthSessionWrapper.getChildWithDefault encountered "
+            "unexpected error",
+            failure=result,
+        )
+        return _UnsafeErrorPage(500, "Internal Error", "")
 
     def _selectParseHeader(self, header):
         """
