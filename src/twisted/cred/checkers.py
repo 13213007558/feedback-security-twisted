@@ -165,6 +165,11 @@ class FilePasswordDB:
     CredentialsChecker will only be able to check L{IUsernamePassword}
     credentials.  If the passwords are stored plaintext,
     L{IUsernameHashedPassword} credentials will be checkable as well.
+
+    The hash function may return its result as a plain value or as a
+    L{Deferred}.  Returning a L{Deferred} allows a slow password hash to be
+    computed by an executor (typically a thread pool) instead of blocking
+    the reactor.
     """
 
     cache = False
@@ -208,7 +213,13 @@ class FilePasswordDB:
         against the version stored on disk.  The arguments to the callable
         are the username, the network-supplied password, and the in-file
         version of the password.  If the return value compares equal to the
-        version stored on disk, the credentials are accepted.
+        version stored on disk, the credentials are accepted.  The callable
+        may return the transformed password directly or a L{Deferred}
+        firing with it; returning a L{Deferred} lets an expensive hash be
+        computed off the reactor thread (for example with
+        L{twisted.internet.threads.deferToThread}) without blocking it.  A
+        L{Deferred} that fails or is cancelled never authenticates the
+        user.
 
         @type cache: L{bool}
         @param cache: If true, maintain an in-memory cache of the
@@ -250,6 +261,24 @@ class FilePasswordDB:
             return username
         else:
             return failure.Failure(error.UnauthorizedLogin())
+
+    def _cbHashMatch(self, hashedPassword, storedPassword, username):
+        """
+        Compare the password produced by the hash callback with the
+        password read from the file for this request.
+
+        @param hashedPassword: The value returned by L{hash}, either
+            directly or as the result of a L{Deferred}.
+        @param storedPassword: The password material read from the file
+            before the hash callback was invoked.
+        @param username: The canonicalized avatar ID to return on a match.
+
+        @return: C{username} when the values compare equal, otherwise a
+            L{failure.Failure} wrapping L{error.UnauthorizedLogin}.
+        """
+        if hashedPassword == storedPassword:
+            return username
+        return failure.Failure(error.UnauthorizedLogin())
 
     def _loadCredentials(self):
         """
@@ -311,22 +340,31 @@ class FilePasswordDB:
     def requestAvatarId(
         self, credentials: IUsernamePassword
     ) -> Deferred[bytes | tuple[()]]:
+        # The username and password material are read from the file exactly
+        # once and captured for the whole request.  Nothing below re-reads
+        # the file, so a change to it while a hash Deferred is in flight
+        # cannot mix two sets of credentials into one authentication.
         try:
-            u, p = self.getUser(credentials.username)
+            username, storedPassword = self.getUser(credentials.username)
         except KeyError:
             return defer.fail(error.UnauthorizedLogin())
         else:
             up = IUsernamePassword(credentials, None)
             if self.hash:
-                if up is not None:
-                    h = self.hash(up.username, up.password, p)
-                    if h == p:
-                        return defer.succeed(u)
-                return defer.fail(error.UnauthorizedLogin())
+                if up is None:
+                    return defer.fail(error.UnauthorizedLogin())
+                # maybeDeferred accepts both a plain hash result and a
+                # Deferred returned by an asynchronous hash.  A failure or
+                # cancellation of that Deferred propagates as a failure of
+                # the returned Deferred instead of becoming a successful
+                # login; only an actual match yields the avatar ID.
+                return defer.maybeDeferred(
+                    self.hash, up.username, up.password, storedPassword
+                ).addCallback(self._cbHashMatch, storedPassword, username)
             else:
-                return defer.maybeDeferred(credentials.checkPassword, p).addCallback(
-                    self._cbPasswordMatch, u
-                )
+                return defer.maybeDeferred(
+                    credentials.checkPassword, storedPassword
+                ).addCallback(self._cbPasswordMatch, username)
 
 
 # For backwards compatibility

@@ -427,6 +427,92 @@ how the SimpleRealm in the previous example is deployed using an in-memory crede
 
    
 
+File-based checkers and slow password hashing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:py:class:`FilePasswordDB <twisted.cred.checkers.FilePasswordDB>` reads
+usernames and password material from a delimited text file.  When the
+passwords on disk are hashed, you supply a ``hash`` callable which turns the
+plaintext password received over the network into the form stored on disk.
+The checker accepts the login only when that value equals the stored one.
+
+The ``hash`` callable may return either the transformed password or a
+:py:class:`Deferred <twisted.internet.defer.Deferred>` firing with it.  A
+plain return value keeps the checker fully synchronous and backwards
+compatible; a ``Deferred`` lets a deliberately slow password hash (a key
+derivation function such as PBKDF2, scrypt or argon2, for example) run away
+from the reactor thread instead of blocking the whole process.
+
+Running the check in a thread
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Wrap the blocking hash with
+:py:func:`deferToThread <twisted.internet.threads.deferToThread>` and return
+the resulting ``Deferred`` from ``hash``.  Only the CPU-bound hash needs to
+leave the reactor; ``FilePasswordDB`` still reads and parses the file for
+you::
+
+    from twisted.internet import threads
+    from twisted.cred.checkers import FilePasswordDB
+
+
+    def slowKDF(password, salt, rounds):
+        # A blocking, CPU-expensive derivation.  Never call it directly on
+        # the reactor thread.
+        ...
+        return derived
+
+
+    def hashCallback(username, password, stored):
+        # "stored" is the value read from the password file, here assumed
+        # to encode the salt and parameters.  Return the Deferred instead
+        # of waiting for the result.
+        salt, rounds = unpackParameters(stored)
+        return threads.deferToThread(slowKDF, password, salt, rounds)
+
+
+    checker = FilePasswordDB("passwords.txt", hash=hashCallback)
+
+While the ``Deferred`` is outstanding the reactor keeps serving other
+connections and requests.  The checker resolves the request with the
+canonicalized avatar ID only when the hash result actually matches the
+stored material: a hash that fails, or a ``Deferred`` that is cancelled,
+fails the login rather than authenticating the user.  Cancelling the
+``Deferred`` returned by the checker propagates the cancellation to the
+hash ``Deferred`` as well.
+
+Each request reads the username and the stored password once, before the
+``hash`` callable runs, and keeps that pair for its entire lifetime.  The
+checker never re-reads the file while a hash ``Deferred`` is in flight, so
+replacing the file mid-request cannot mix two sets of password material
+into one authentication, and one request's late result can never overwrite
+another request's identity.
+
+Choosing when file updates take effect
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``FilePasswordDB`` itself stays a thin checker over a text file; Twisted
+does not add a separate password storage system.  How a changed password
+file is picked up is decided entirely by the ``cache`` argument:
+
+- With the default ``cache=False`` every login opens and parses the file,
+  so an edit (or replacing the file atomically, for example with
+  ``os.replace``) is visible to the very next request.  This is the right
+  choice when the file is small or changes often.
+- With ``cache=True`` the parsed contents are kept in memory and the file
+  is re-read only when its modification time advances.  This avoids
+  re-parsing on every login at the cost of an update being delayed until
+  the modification time changes; write the new file and then ``utime`` it
+  (or replace it) so the change is detected.
+
+Either way, a request that is already checking a password finishes against
+the material it read when it started; the new file only affects requests
+that begin after the replacement is observed.  If you need stronger
+guarantees, such as atomic rotation coordinated with other state, perform
+that coordination in the code that writes the password file.
+
+
+
 Cred plugins
 ------------
 

@@ -1,0 +1,1 @@
+twisted.cred.checkers.FilePasswordDB now accepts a hash callable that returns a Deferred, so a slow password hash can run on an executor without blocking the reactor. Synchronous hash callables keep working unchanged; failed or cancelled hashes never authenticate the user.

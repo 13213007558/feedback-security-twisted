@@ -6,6 +6,8 @@ Tests for L{twisted.cred}, now with 30% more starch.
 """
 
 
+import os
+import time
 from binascii import hexlify, unhexlify
 
 from zope.interface import Interface, implementer
@@ -315,6 +317,241 @@ class HashedPasswordOnDiskDatabaseTests(unittest.TestCase):
 
     if crypt is None:
         skip = "crypt module not available"
+
+
+class _ControllableHash:
+    """
+    Stand-in for a slow hash function run by an executor.
+
+    It never performs real hashing or threading: each call records its
+    arguments and returns an unfired L{Deferred} which the test resolves by
+    hand.  The canceller intentionally does nothing, mirroring work running
+    on a thread which cannot be interrupted; cancelling the outer request
+    must still fail the login without waiting for that work.
+    """
+
+    def __init__(self):
+        self.pending = []
+
+    def __call__(self, username, password, storedPassword):
+        d = defer.Deferred(canceller=lambda ignored: None)
+        self.pending.append((username, password, storedPassword, d))
+        return d
+
+    @property
+    def deferreds(self):
+        return [entry[-1] for entry in self.pending]
+
+
+class AsyncHashFilePasswordDBTests(unittest.TestCase):
+    """
+    Tests for L{checkers.FilePasswordDB} when the hash callback returns a
+    L{Deferred}, as a slow hash dispatched to an executor would.
+    """
+
+    password = b"secret"
+    storedHash = b"the-stored-hash"
+    wrongHash = b"a-different-hash"
+
+    def setUp(self):
+        self.dbfile = self.mktemp()
+        with open(self.dbfile, "wb") as f:
+            f.write(b"user1:" + self.storedHash + b"\n")
+        self.hash = _ControllableHash()
+        self.portal = self._makePortal()
+
+    def _makeChecker(self, caseSensitive=True, cache=False):
+        return checkers.FilePasswordDB(
+            self.dbfile,
+            hash=self.hash,
+            caseSensitive=caseSensitive,
+            cache=cache,
+        )
+
+    def _makePortal(self, **kwargs):
+        realm = TestRealm()
+        port = portal.Portal(realm)
+        port.registerChecker(self._makeChecker(**kwargs))
+        return port
+
+    def _login(self, username=b"user1", password=None):
+        if password is None:
+            password = self.password
+        return self.portal.login(
+            credentials.UsernamePassword(username, password), None, ITestable
+        )
+
+    def _avatarName(self, result):
+        _iface, impl, _logout = result
+        return impl.original.name
+
+    def test_synchronousHashSucceeds(self):
+        """
+        A hash callback returning a plain value keeps working, so existing
+        synchronous callers remain compatible.
+        """
+        db = checkers.FilePasswordDB(self.dbfile, hash=lambda u, p, s: self.storedHash)
+        d = db.requestAvatarId(credentials.UsernamePassword(b"user1", self.password))
+        self.assertEqual(self.successResultOf(d), b"user1")
+
+    def test_synchronousHashRaisesFails(self):
+        """
+        An exception raised synchronously by the hash callback surfaces as a
+        failed login rather than being swallowed or treated as a match.
+        """
+
+        def brokenHash(username, password, storedPassword):
+            raise RuntimeError("hash exploded")
+
+        db = checkers.FilePasswordDB(self.dbfile, hash=brokenHash)
+        d = db.requestAvatarId(credentials.UsernamePassword(b"user1", self.password))
+        self.assertEqual(
+            self.failureResultOf(d, RuntimeError).getErrorMessage(),
+            "hash exploded",
+        )
+
+    def test_asyncSuccessThroughPortal(self):
+        """
+        A L{Deferred} returned by the hash callback that resolves to the
+        stored hash authenticates the user through L{portal.Portal}.
+        """
+        d = self._login()
+        self.assertNoResult(d)
+        self.hash.deferreds[0].callback(self.storedHash)
+        self.assertEqual(self._avatarName(self.successResultOf(d)), b"user1")
+
+    def test_asyncWrongPasswordRejected(self):
+        """
+        An asynchronous hash result that does not equal the stored password
+        fails the login with L{error.UnauthorizedLogin}.
+        """
+        d = self._login(password=b"guessed")
+        self.hash.deferreds[0].callback(self.wrongHash)
+        self.failureResultOf(d, error.UnauthorizedLogin)
+
+    def test_asyncCallbackFailureRejected(self):
+        """
+        A failed hash L{Deferred} fails the login with the underlying error
+        and never produces an avatar.
+        """
+        d = self._login()
+        self.hash.deferreds[0].errback(RuntimeError("hash exploded"))
+        self.assertEqual(
+            self.failureResultOf(d, RuntimeError).getErrorMessage(),
+            "hash exploded",
+        )
+
+    def test_asyncCancelledLoginRejected(self):
+        """
+        Cancelling the login L{Deferred} fails it with
+        L{defer.CancelledError}.  The stand-in executor cannot be
+        interrupted, but the cancelled login can never turn into a
+        successful authentication.
+        """
+        d = self._login()
+        self.assertNoResult(d)
+        d.cancel()
+        failure = self.failureResultOf(d, defer.CancelledError)
+
+        # The hash Deferred is already resolved as a cancellation by the
+        # time the executor would report back, so there is no pending result
+        # left which could grant access.
+        self.assertTrue(self.hash.deferreds[0].called)
+        self.assertEqual(failure.type, defer.CancelledError)
+
+    def test_lateSuccessCannotOverwriteCancellation(self):
+        """
+        A later, successful request cannot overwrite the outcome of an
+        earlier cancelled one: the cancelled login stays a
+        L{defer.CancelledError} failure while the independent request still
+        authenticates on its own hash L{Deferred}.
+        """
+        cancelled = self._login()
+        cancelled.cancel()
+        cancelledFailure = self.failureResultOf(cancelled, defer.CancelledError)
+
+        # A separately-started request whose hash genuinely matches still
+        # authenticates independently, without changing the first result.
+        later = self._login()
+        self.assertNoResult(later)
+        self.hash.deferreds[-1].callback(self.storedHash)
+        self.assertEqual(self._avatarName(self.successResultOf(later)), b"user1")
+        self.assertEqual(cancelledFailure.type, defer.CancelledError)
+
+    def test_asyncReturnsCanonicalAvatarId(self):
+        """
+        A case-insensitive database looks up the lowercased username while
+        the hash still receives the network-supplied username, and a
+        successful asynchronous match returns the canonicalized avatar ID
+        read from the file.
+        """
+        self.portal = self._makePortal(caseSensitive=False)
+        d = self._login(username=b"USER1")
+        self.assertEqual(self.hash.pending[0][0], b"USER1")
+        self.hash.deferreds[0].callback(self.storedHash)
+        self.assertEqual(self._avatarName(self.successResultOf(d)), b"user1")
+
+    def test_requestsCompleteInReverseOrder(self):
+        """
+        Two overlapping logins keep their identities separate when their
+        hash L{Deferred}s fire out of order: neither request can resolve to
+        the other request's avatar.
+        """
+        with open(self.dbfile, "wb") as f:
+            f.write(b"user1:" + self.storedHash + b"\n")
+            f.write(b"user2:" + self.storedHash + b"\n")
+
+        first = self._login(b"user1")
+        second = self._login(b"user2")
+        self.assertNoResult(first)
+        self.assertNoResult(second)
+
+        self.assertEqual(
+            [entry[0] for entry in self.hash.pending], [b"user1", b"user2"]
+        )
+
+        # The second request's hash completes before the first's.
+        self.hash.deferreds[1].callback(self.storedHash)
+        self.assertEqual(self._avatarName(self.successResultOf(second)), b"user2")
+        self.assertNoResult(first)
+
+        self.hash.deferreds[0].callback(self.storedHash)
+        self.assertEqual(self._avatarName(self.successResultOf(first)), b"user1")
+
+    def test_fileChangedWhileHashPending(self):
+        """
+        A request validates against the credentials read when it started:
+        replacing the password file while its hash L{Deferred} is in flight
+        neither mixes the two password materials into that request nor
+        changes the avatar it resolves to.
+        """
+        for cache in (False, True):
+            with open(self.dbfile, "wb") as f:
+                f.write(b"user1:" + self.storedHash + b"\n")
+            self.hash = _ControllableHash()
+            self.portal = self._makePortal(cache=cache)
+
+            d = self._login()
+            self.assertEqual(self.hash.pending[0][2], self.storedHash)
+
+            # Replace the file, giving the user a different hash and forcing
+            # a strictly newer mtime so a caching checker must reload it.
+            with open(self.dbfile, "wb") as f:
+                f.write(b"user1:" + self.wrongHash + b"\n")
+            future = time.time() + 10
+            os.utime(self.dbfile, (future, future))
+
+            # The in-flight request still compares against the hash it read
+            # at the start and succeeds with its original avatar.
+            self.hash.deferreds[0].callback(self.storedHash)
+            self.assertEqual(self._avatarName(self.successResultOf(d)), b"user1")
+
+            # A fresh request observes the replacement and rejects the old
+            # password against the new material.
+            newLogin = self._login()
+            self.assertEqual(self.hash.pending[-1][2], self.wrongHash)
+            self.hash.deferreds[-1].callback(self.storedHash)
+            self.failureResultOf(newLogin, error.UnauthorizedLogin)
 
 
 class CheckersMixin:
