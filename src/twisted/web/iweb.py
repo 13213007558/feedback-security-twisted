@@ -450,6 +450,82 @@ class ICredentialFactory(Interface):
         """
 
 
+class INonceCountStore(Interface):
+    """
+    Storage for the nonce counts (C{nc}) used by HTTP Digest authentication
+    with a C{qop=auth} quality of protection.
+
+    The store keeps, per nonce and per C{(username, cnonce)} pair, the count
+    which was most recently committed for a successfully authenticated
+    request.  It is used to reject replayed or out-of-order C{Authorization}
+    headers.
+
+    The three mutation methods describe the two phases of an authentication
+    attempt.  A count is first B{reserved} before the password is checked and
+    is only B{committed} once the password check has succeeded; a failed
+    password check B{rolls the reservation back} so that an error response
+    never consumes a count.
+
+    Implementations only need to be safe against the cooperative
+    concurrency of a single Twisted reactor thread: each method may assume no
+    other method runs while it is executing synchronously.
+    """
+
+    def reserve(nonce, username, cnonce, nonceCount):
+        """
+        Reserve C{nonceCount} for a pending authentication attempt.
+
+        @param nonce: The challenge nonce the response was built against.
+        @type nonce: L{bytes}
+
+        @param username: The username from the response.
+        @type username: L{bytes}
+
+        @param cnonce: The client nonce from the response.
+        @type cnonce: L{bytes}
+
+        @param nonceCount: The parsed nonce count from the response.
+        @type nonceCount: L{int}
+
+        @raise twisted.cred.error.LoginFailed: If C{nonceCount} is not
+            strictly greater than the count already committed for this
+            C{nonce}, C{username}, and C{cnonce}, or if a reservation for the
+            same C{nonceCount} is already in flight.
+
+        @return: An opaque token identifying the reservation.  It must be
+            passed unchanged to L{commit} or L{rollback}.
+        @rtype: L{object}
+        """
+
+    def commit(token):
+        """
+        Commit a reservation after a successful password check.
+
+        The reserved count becomes the new last-seen count for the
+        C{(nonce, username, cnonce)} pair.
+
+        @param token: The token returned by L{reserve}.
+        """
+
+    def rollback(token):
+        """
+        Release a reservation after a failed password check.
+
+        The reserved count becomes available again, so an error response
+        never consumes a count.
+
+        @param token: The token returned by L{reserve}.
+        """
+
+    def purge(now):
+        """
+        Discard every state entry which can no longer be used.
+
+        @param now: The current time, as returned by the reactor's clock.
+        @type now: L{float}
+        """
+
+
 class IBodyProducer(IPushProducer):
     """
     Objects which provide L{IBodyProducer} write bytes to an object which
@@ -831,6 +907,7 @@ UNKNOWN_LENGTH = "twisted.web.iweb.UNKNOWN_LENGTH"
 __all__ = [
     "IUsernameDigestHash",
     "ICredentialFactory",
+    "INonceCountStore",
     "IRequest",
     "IBodyProducer",
     "IRenderable",

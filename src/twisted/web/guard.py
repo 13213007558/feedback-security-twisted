@@ -9,7 +9,7 @@ authentication and authorization of HTTP requests.
 
 
 from twisted.web._auth.basic import BasicCredentialFactory
-from twisted.web._auth.digest import DigestCredentialFactory
+from twisted.web._auth.digest import DigestCredentialFactory, NonceCountStore
 
 # Expose HTTP authentication classes here.
 from twisted.web._auth.wrapper import HTTPAuthSessionWrapper
@@ -18,4 +18,5 @@ __all__ = [
     "HTTPAuthSessionWrapper",
     "BasicCredentialFactory",
     "DigestCredentialFactory",
+    "NonceCountStore",
 ]

@@ -293,3 +293,42 @@ And voila, a password-protected per-user Twisted Web server.
 
 
 
+
+Replay protection
+=================
+
+Digest authentication proves that the client knows the password, but on its
+own it does not stop an attacker who captured an ``Authorization`` header
+from re-sending it unchanged.  For the ``qop=auth`` quality of protection,
+RFC 2617 defines a per-request nonce count (``nc``) which a compliant client
+increments on every request.  ``DigestCredentialFactory`` can track these
+counts and reject a header whose count was already accepted, or which is not
+strictly greater than the last one seen.
+
+Replay protection is opt-in: pass an ``INonceCountStore`` provider as the
+third argument.  Twisted ships an in-process implementation,
+``NonceCountStore``, which needs no external database::
+
+
+    from twisted.web.guard import (
+        DigestCredentialFactory,
+        NonceCountStore,
+    )
+
+    credentialFactory = DigestCredentialFactory(
+        "md5", "localhost:8080", NonceCountStore()
+    )
+
+A count is *reserved* before the password is checked and is only *committed*
+once that check succeeds.  A failed check rolls the reservation back, so an
+authentication error never consumes a count, and two concurrent requests
+presenting the same count cannot both succeed.  State belonging to expired
+nonces is reclaimed automatically; the retention time is configurable and
+defaults to the lifetime of a challenge.
+
+Because a request sent without ``qop`` carries no nonce count, it cannot be
+distinguished from a replayed request and is rejected while replay
+protection is enabled.  Leave the store unset (the default) to preserve the
+historical, permissive behavior.  Applications may supply their own
+``INonceCountStore`` implementation to change where the per-nonce state is
+kept.
