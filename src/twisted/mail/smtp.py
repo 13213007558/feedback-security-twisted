@@ -188,6 +188,37 @@ def rfc822date(timeinfo=None, local=1):
     )
 
 
+# Characters that terminate an RFC 5322 header line.  The HELO/EHLO argument
+# is attacker-controlled text which is reflected into the generated
+# Received header, so any line break in it would let the client forge
+# additional headers.
+_LINE_BREAKS = re.compile(rb"[\r\n]")
+
+
+def sanitizeHeloArgument(helo):
+    """
+    Neutralize line breaks in a client-supplied HELO/EHLO argument so it can
+    be embedded safely in a server-generated C{Received} header.
+
+    The argument is taken from a single SMTP command line, so a valid value
+    never contains CR or LF; replacing rather than rejecting those bytes
+    preserves the rest of the (untrusted, client-asserted) name while making
+    it impossible to start a new header line.  All other bytes, including
+    whitespace, non-ASCII bytes and punctuation, are left untouched.
+
+    @type helo: L{bytes} or L{None}
+    @param helo: The HELO/EHLO argument, or L{None} when the client did not
+        issue HELO/EHLO before the message was accepted.
+
+    @rtype: L{bytes}
+    @return: The argument with CR and LF replaced by spaces, or an empty
+        byte string for L{None}.
+    """
+    if helo is None:
+        return b""
+    return _LINE_BREAKS.sub(b" ", helo)
+
+
 def idGenerator():
     i = 0
     while True:
@@ -885,14 +916,35 @@ class SMTP(basic.LineOnlyReceiver, policies.TimeoutMixin):
         if self.delivery is not None:
             return self.delivery.receivedHeader(helo, origin, recipients)
 
+        # The HELO name is asserted by the client and cannot be trusted.
+        # Strip line breaks so it cannot inject extra headers into the
+        # message; the transport peer address below is the real source.
+        clientName = sanitizeHeloArgument(helo[0])
+        clientIP = networkString(nativeString(helo[1]))
+
         heloStr = b""
-        if helo[0]:
-            heloStr = b" helo=" + helo[0]
+        if clientName:
+            heloStr = b" helo=" + clientName
         domain = networkString(self.transport.getHost().host)
 
-        from_ = b"from " + helo[0] + b" ([" + helo[1] + b"]" + heloStr + b")"
-        by = b"by %s with %s (%s)" % (domain, self.__class__.__name__, longversion)
-        for_ = b"for %s; %s" % (" ".join(map(str, recipients)), rfc822date())
+        from_ = (
+            b"from "
+            + clientName
+            + b" (["
+            + clientIP
+            + b"]"
+            + heloStr
+            + b")"
+        )
+        by = b"by %s with %s (%s)" % (
+            domain,
+            networkString(self.__class__.__name__),
+            networkString(longversion),
+        )
+        for_ = b"for %s; %s" % (
+            b" ".join(map(bytes, recipients)),
+            rfc822date(),
+        )
         return b"Received: " + from_ + b"\n\t" + by + b"\n\t" + for_
 
 

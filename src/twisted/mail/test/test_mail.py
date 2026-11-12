@@ -924,6 +924,48 @@ class ServiceDomainTests(TestCase):
         self.assertEqual(len(m.items()), 1)
         self.assertIn("Received", m)
 
+    def test_receivedHeaderSanitizesHelo(self):
+        """
+        The HELO name reflected by L{DomainDeliveryBase.receivedHeader} is
+        client-asserted and must not be able to inject a line break, which
+        would forge additional headers in the delivered message.
+        """
+        self.D.host = b"hostname"
+        self.D.protocolName = b"TEST"
+        hdr = self.D.receivedHeader(
+            (b"evil.example\nX-Injected: pwned", b"192.0.2.1"),
+            smtp.Address(b"<someguy@someplace>"),
+            [
+                smtp.User(
+                    b"user@host.name", (b"helo", b"192.0.2.1"), None, None
+                )
+            ],
+        )
+        self.assertNotIn(b"\nX-Injected", hdr)
+        self.assertIn(b"evil.example X-Injected: pwned", hdr)
+        # The genuine peer remains visible separately from the claim.
+        self.assertIn(b"[192.0.2.1]", hdr)
+        parsed = email.message_from_bytes(hdr)
+        self.assertIsNone(parsed["X-Injected"])
+        self.assertEqual(["Received"], [name for name, _ in parsed.items()])
+
+    def test_receivedHeaderNoHelo(self):
+        """
+        A L{None} HELO name (message accepted without HELO/EHLO) does not
+        break the delivery-generated header.
+        """
+        self.D.host = b"hostname"
+        self.D.protocolName = b"TEST"
+        hdr = self.D.receivedHeader(
+            (None, b"192.0.2.1"),
+            smtp.Address(b"<someguy@someplace>"),
+            [smtp.User(b"user@host.name", (None, b"192.0.2.1"), None, None)],
+        )
+        self.assertNotIn(b"helo=", hdr)
+        self.assertIn(b"[192.0.2.1]", hdr)
+        parsed = email.message_from_bytes(hdr)
+        self.assertEqual(["Received"], [name for name, _ in parsed.items()])
+
     @skipIf(sys.version_info >= (3,), "not ported to Python 3")
     def testValidateTo(self):
         user = smtp.User("user@test.domain", "helo", None, "wherever@whatever")

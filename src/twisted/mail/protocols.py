@@ -75,9 +75,20 @@ class DomainDeliveryBase:
         authStr = heloStr = b""
         if self.user:
             authStr = b" auth=" + self.user.encode("xtext")
-        if helo[0]:
-            heloStr = b" helo=" + helo[0]
-        fromUser = b"from " + helo[0] + b" ([" + helo[1] + b"]" + heloStr + authStr
+        # The HELO name is client-asserted and untrusted; neutralize any
+        # line breaks so it cannot forge additional header lines.
+        clientName = smtp.sanitizeHeloArgument(helo[0])
+        if clientName:
+            heloStr = b" helo=" + clientName
+        fromUser = (
+            b"from "
+            + clientName
+            + b" (["
+            + helo[1]
+            + b"]"
+            + heloStr
+            + authStr
+        )
         by = (
             b"by "
             + self.host

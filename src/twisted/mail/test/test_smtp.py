@@ -7,6 +7,7 @@ Test cases for twisted.mail.smtp module.
 from __future__ import annotations
 
 import base64
+import email
 import inspect
 import re
 from io import BytesIO
@@ -1276,6 +1277,335 @@ class SMTPServerTests(TestCase):
             b"550 Cannot receive from specified address "
             b"<alice@example.com>: Unauthenticated senders not allowed\r\n",
         )
+
+
+class _HeaderCollectingMessage:
+    """
+    L{IMessage} which records every line handed to it, including the
+    server-generated C{Received} header and the untrusted message content.
+
+    The lines are joined on LF just like a file/maildir style delivery, so
+    that any LF embedded in the generated header would show up as a header
+    boundary when the result is parsed by a standards compliant parser.
+    """
+
+    def __init__(self):
+        self.lines = []
+
+    def lineReceived(self, line):
+        self.lines.extend(line.split(b"\n"))
+
+    def eomReceived(self):
+        self.message = b"\r\n".join(self.lines) + b"\r\n"
+        return defer.succeed(b"saved")
+
+    def connectionLost(self):
+        pass
+
+
+class _AcceptAllSMTP(smtp.SMTP):
+    """
+    SMTP server which accepts every sender and recipient and, crucially, has
+    no C{delivery} object, so L{smtp.SMTP.receivedHeader} runs its built-in
+    default implementation.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.message = _HeaderCollectingMessage()
+
+    def validateFrom(self, helo, origin):
+        return origin
+
+    def validateTo(self, user):
+        return lambda: self.message
+
+
+class _AcceptAllESMTP(smtp.ESMTP):
+    """
+    ESMTP counterpart of L{_AcceptAllSMTP} with no C{delivery} object.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.message = _HeaderCollectingMessage()
+
+    def validateFrom(self, helo, origin):
+        return origin
+
+    def validateTo(self, user):
+        return lambda: self.message
+
+
+@implementer(smtp.IMessageDelivery)
+class _HeaderDelivery:
+    """
+    Delivery object whose L{receivedHeader} supplies a custom, fully
+    attacker-reflecting header, exercising the extension boundary where the
+    server delegates header generation to the delivery.
+    """
+
+    def __init__(self):
+        self.message = _HeaderCollectingMessage()
+
+    def validateFrom(self, helo, origin):
+        return origin
+
+    def validateTo(self, user):
+        return lambda: self.message
+
+    def receivedHeader(self, helo, origin, recipients):
+        return (
+            b"Received: from delivery "
+            + helo[0]
+            + b" (["
+            + helo[1]
+            + b"]) by delivery;"
+        )
+
+
+class ReceivedHeaderTests(TestCase):
+    """
+    Tests for the C{Received} header the server generates itself.
+
+    The header must keep the transport-level peer address (the real source)
+    distinguishable from the client-asserted HELO/EHLO name, must not let that
+    untrusted name inject additional headers, and must leave C{Received}
+    headers supplied inside DATA untouched as untrusted message content.
+    """
+
+    _BODY = (
+        b"Received: from attacker-laptop "
+        b"([6.6.6.6] helo=forged) by victim;\r\n"
+        b"Subject: hello\r\n"
+        b"\r\n"
+        b"Normal body text\r\n"
+    )
+
+    def _deliver(
+        self, serverClass, heloArgument, command=b"HELO", delivery=None
+    ):
+        """
+        Drive a full message through the protocol and return the delivered
+        bytes plus the raw header line produced by L{receivedHeader}.
+        """
+        if delivery is None:
+            proto = serverClass()
+        else:
+            proto = serverClass(delivery=delivery)
+        transport = StringTransport()
+        proto.makeConnection(transport)
+
+        if heloArgument is not None:
+            proto.dataReceived(command + b" " + heloArgument + b"\r\n")
+        proto.dataReceived(b"MAIL FROM:<alice@example.com>\r\n")
+        proto.dataReceived(b"RCPT TO:<bob@example.net>\r\n")
+        proto.dataReceived(b"DATA\r\n")
+        proto.dataReceived(self._BODY)
+        proto.dataReceived(b".\r\n")
+        proto.setTimeout(None)
+        proto.connectionLost(error.ConnectionDone())
+
+        message = delivery.message if delivery is not None else proto.message
+        return message.message, message.lines[0]
+
+    def _assertTwoReceivedHeaders(self, message):
+        parsed = email.message_from_bytes(message)
+        self.assertEqual(2, len(parsed.get_all("Received")))
+        return parsed
+
+    def test_defaultHeaderStructure(self):
+        """
+        The default header records both the client-asserted HELO name and the
+        genuine transport peer, alongside the local host and recipient.
+        """
+        message, firstLine = self._deliver(
+            _AcceptAllSMTP, b"client.example.org"
+        )
+        # The generated header is the first three LF-folded lines.
+        rawHeader = b"\n".join(message.split(b"\r\n")[:3])
+        self.assertTrue(firstLine.startswith(b"Received: "))
+        self.assertIn(b"from client.example.org", rawHeader)
+        self.assertIn(b"helo=client.example.org", rawHeader)
+        # The transport peer (StringTransport default) is the real source.
+        self.assertIn(b"[192.168.1.1]", rawHeader)
+        self.assertIn(b"by 10.0.0.1 with _AcceptAllSMTP", rawHeader)
+        self.assertIn(b"for bob@example.net;", rawHeader)
+        self.assertIn(b"[Twisted, version", rawHeader)
+
+    def test_defaultHeaderIsSingleParsedHeader(self):
+        """
+        A standard mail parser sees exactly one server-generated trace field
+        followed by the client-supplied one, and never an injected field.
+        """
+        message, _ = self._deliver(_AcceptAllSMTP, b"client.example.org")
+        parsed = email.message_from_bytes(message)
+        received = parsed.get_all("Received")
+        self.assertEqual(2, len(received))
+        self.assertIn("192.168.1.1", received[0])
+        self.assertIn("6.6.6.6", received[1])
+        headerNames = [name for name, _ in parsed.items()]
+        self.assertEqual(["Received", "Received", "Subject"], headerNames)
+        self.assertEqual("Normal body text", parsed.get_payload().strip())
+
+    def test_heloLineFeedCannotInjectHeader(self):
+        """
+        A bare LF in the HELO argument must not start a new header line.
+        """
+        evil = b"evil.example\nX-Injected: pwned"
+        message, rawHeader = self._deliver(_AcceptAllSMTP, evil)
+        self.assertNotIn(b"\nX-Injected", rawHeader)
+        self.assertIn(b"evil.example X-Injected: pwned", rawHeader)
+
+        parsed = email.message_from_bytes(message)
+        self.assertIsNone(parsed["X-Injected"])
+        self.assertEqual(2, len(parsed.get_all("Received")))
+
+    def test_heloCarriageReturnCannotInjectHeader(self):
+        """
+        A bare CR in the HELO argument must not start a new header line.
+        """
+        evil = b"evil.example\rX-Injected: cr"
+        message, rawHeader = self._deliver(_AcceptAllSMTP, evil)
+        self.assertNotIn(b"\rX-Injected", rawHeader)
+        self.assertIn(b"evil.example X-Injected: cr", rawHeader)
+
+        parsed = email.message_from_bytes(message)
+        self.assertIsNone(parsed["X-Injected"])
+        self.assertEqual(2, len(parsed.get_all("Received")))
+
+    def test_heloCrlfCannotInjectHeader(self):
+        """
+        Even if a CRLF reaches the reflected value, it is neutralized rather
+        than turned into a header boundary.
+        """
+        evil = b"evil.example\r\nX-Injected: crlf"
+        message, rawHeader = self._deliver(_AcceptAllSMTP, evil)
+        parsed = email.message_from_bytes(message)
+        self.assertIsNone(parsed["X-Injected"])
+        self.assertEqual(2, len(parsed.get_all("Received")))
+
+    def test_heloPunctuationAndAddressLiteralPreserved(self):
+        """
+        Parentheses, quotes and bracketed address literals are legal in the
+        free-form HELO name and survive verbatim, inside one header only.
+        """
+        name = b'(evil) "quoted" [192.0.2.10]'
+        message, rawHeader = self._deliver(_AcceptAllSMTP, name)
+        self.assertIn(name, rawHeader)
+        parsed = email.message_from_bytes(message)
+        self.assertEqual(2, len(parsed.get_all("Received")))
+        self.assertIsNone(parsed["[192.0.2.10]"])
+
+    def test_heloNonAsciiBytesPreserved(self):
+        """
+        Non-ASCII bytes in the HELO name do not crash header generation and
+        remain confined to the single server header.
+        """
+        name = b"cl\xefent.example"
+        message, rawHeader = self._deliver(_AcceptAllSMTP, name)
+        self.assertIn(name, rawHeader)
+        parsed = email.message_from_bytes(message)
+        self.assertEqual(2, len(parsed.get_all("Received")))
+
+    def test_heloControlAndWhitespaceBytes(self):
+        """
+        Tabs, NUL and whitespace other than CR/LF do not create new headers.
+        """
+        name = b"a\tb\x00c "
+        message, rawHeader = self._deliver(_AcceptAllSMTP, name)
+        self.assertIn(b"a\tb\x00c", rawHeader)
+        parsed = email.message_from_bytes(message)
+        self.assertEqual(2, len(parsed.get_all("Received")))
+
+    def test_blankHeloName(self):
+        """
+        An empty HELO argument yields a header without a C{helo=} clause but
+        still records the transport peer.
+        """
+        message, rawHeader = self._deliver(_AcceptAllSMTP, b"")
+        self.assertNotIn(b"helo=", rawHeader)
+        self.assertIn(b"[192.168.1.1]", rawHeader)
+        self._assertTwoReceivedHeaders(message)
+
+    def test_noHeloBeforeData(self):
+        """
+        A message accepted without any HELO/EHLO must not raise while the
+        default header is built; the peer address is still recorded.
+        """
+        message, rawHeader = self._deliver(_AcceptAllSMTP, None)
+        self.assertNotIn(b"helo=", rawHeader)
+        self.assertIn(b"[192.168.1.1]", rawHeader)
+        self._assertTwoReceivedHeaders(message)
+
+    def test_ehloNameReflectedAndInjectionNeutralized(self):
+        """
+        The ESMTP EHLO name is reflected through the same sanitization, and
+        the transport peer stays visible alongside the client's claim.
+        """
+        message, rawHeader = self._deliver(
+            _AcceptAllESMTP, b"ehlo.client.example", command=b"EHLO"
+        )
+        self.assertIn(b"from ehlo.client.example", rawHeader)
+        self.assertIn(b"[192.168.1.1]", rawHeader)
+        self._assertTwoReceivedHeaders(message)
+
+        evil = b"evil.example\nX-Injected: pwned"
+        message, rawHeader = self._deliver(
+            _AcceptAllESMTP, evil, command=b"EHLO"
+        )
+        parsed = email.message_from_bytes(message)
+        self.assertIsNone(parsed["X-Injected"])
+        self.assertEqual(2, len(parsed.get_all("Received")))
+
+    def test_clientSuppliedReceivedIsUntrustedContent(self):
+        """
+        A C{Received} header sent inside DATA is delivered verbatim and is
+        never replaced or claimed as server-authenticated: it stays a
+        separate, second trace field whose contents the server did not assert.
+        """
+        message, _ = self._deliver(_AcceptAllSMTP, b"client.example.org")
+        parsed = email.message_from_bytes(message)
+        received = parsed.get_all("Received")
+        self.assertEqual(2, len(received))
+        # First is the server's (real peer), second is the client's text.
+        self.assertIn("192.168.1.1", received[0])
+        self.assertIn("attacker-laptop", received[1])
+        self.assertIn("6.6.6.6", received[1])
+        self.assertNotIn("attacker-laptop", received[0])
+
+    def test_customDeliveryHeaderIsUsed(self):
+        """
+        When an L{IMessageDelivery} provides L{receivedHeader}, its header is
+        used verbatim and the client-supplied DATA header is still preserved.
+        """
+        delivery = _HeaderDelivery()
+        message, rawHeader = self._deliver(
+            smtp.SMTP, b"claimed.example", delivery=delivery
+        )
+        self.assertTrue(
+            rawHeader.startswith(b"Received: from delivery claimed.example")
+        )
+        self.assertIn(b"[192.168.1.1]", rawHeader)
+        parsed = email.message_from_bytes(message)
+        self.assertEqual(2, len(parsed.get_all("Received")))
+        self.assertIn("6.6.6.6", parsed.get_all("Received")[1])
+
+    def test_sanitizeHeloArgumentHelper(self):
+        """
+        The helper neutralizes CR/LF, leaves every other byte alone and
+        handles the no-HELO L{None} case.
+        """
+        self.assertEqual(b"a b c", smtp.sanitizeHeloArgument(b"a\rb\nc"))
+        self.assertEqual(
+            b"a\tb\x00c", smtp.sanitizeHeloArgument(b"a\tb\x00c")
+        )
+        self.assertEqual(
+            b'p(q) "r" [::1]',
+            smtp.sanitizeHeloArgument(b'p(q) "r" [::1]'),
+        )
+        self.assertEqual(b"x\xefy", smtp.sanitizeHeloArgument(b"x\xefy"))
+        self.assertEqual(b"", smtp.sanitizeHeloArgument(None))
 
 
 class ESMTPAuthenticationTests(TestCase):
